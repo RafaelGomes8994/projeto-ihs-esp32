@@ -1,0 +1,15 @@
+📁 projeto_robo_ihs
+ ├── 📁 include
+ │    ├── camera_server.h
+ │    ├── xbox_driver.h
+ |    ├── driver_tcp.h
+ │    ├── motores.h
+ │    └── web_page.h
+ ├── 📁 src
+ │    ├── main.cpp
+ │    ├── camera_server.cpp
+ |    ├── driver_tcp.cpp
+ │    ├── xbox_driver.cpp
+ │    ├── motores.cpp
+ │    └── calculo_pwm.S      <-- (Requisito: Código de montagem)
+ └── 📄 platformio.ini
