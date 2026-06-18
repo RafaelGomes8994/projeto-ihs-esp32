@@ -36,6 +36,11 @@ class CallbackSeguranca : public BLESecurityCallbacks {
 
 
 void processarDadosXbox(uint8_t* dados, size_t tamanho) {
+
+    // 1. A MÁGICA DA TELEMETRIA ACONTECE AQUI!
+    // Dispara o pacote imediatamente via rede para o script Python
+    encaminharParaTCP(dados, tamanho);
+
     // 1. Proteção de memória: Garante que o pacote tem o tamanho mínimo esperado
     if (tamanho < 14) return;
 

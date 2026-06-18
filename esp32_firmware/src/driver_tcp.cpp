@@ -4,6 +4,7 @@
 WiFiServer server(8080);
 WiFiClient activeClient; // Guardamos a conexão aqui
 
+
 void inicializarWiFi(const char* ssid, const char* password) {
     WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED) {
