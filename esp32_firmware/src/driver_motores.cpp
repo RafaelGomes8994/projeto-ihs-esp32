@@ -1,66 +1,57 @@
 // =============================================================================
-// driver_motores.cpp — Implementação do Driver de Motores DC
-// Projeto: Rover FPV | Disciplina: IHS — Prof. Bruno Prado / UFS
+// driver_motores.cpp — Implementação do Driver de Motores DC (Ponte H L9110S)
 // =============================================================================
 
 #include "driver_motores.h"
 
-// =============================================================================
-// Pinagem da Ponte H — ajuste conforme o seu cabeamento no ESP32-CAM
-// Pinos disponíveis no ESP32-CAM (sem conflito com câmera e PSRAM):
-//   GPIO 12, 13, 14, 15
-//   EVITE: GPIO 0 (boot), 1/3 (UART), 4 (flash LED), 2/33-39 (câmera)
-// =============================================================================
-static const int pinoMotor1_F = 12;
-static const int pinoMotor1_B = 13;
-static const int pinoMotor2_F = 14;
-static const int pinoMotor2_B = 15;
+// Pinagem (Evitando conflitos com a câmera/flash do ESP32-CAM)
+static const int pinoMotor1_F = 12; // Direção Frente - Motor Esq
+static const int pinoMotor1_B = 13; // Direção Trás - Motor Esq
+static const int pinoMotor2_F = 15; // Direção Frente - Motor Dir
+static const int pinoMotor2_B = 14; // Direção Trás - Motor Dir
 
-// =============================================================================
 // Declaração da função Assembly (calculo_pwm.S)
-// =============================================================================
 extern "C" uint32_t calcularPWM(uint8_t entrada);
 
-// CORREÇÃO: pwmValue era uma variável global inicializada com calcularPWM(200).
-// Variáveis globais com inicializadores não-triviais (chamadas de função) são
-// executadas ANTES do setup(), durante a fase de inicialização estática do C++.
-// Chamar Assembly nesse momento é arriscado e desnecessário.
-// Solução: inicializar dentro de inicializarMotores() como variável local estática.
 static uint32_t pwmVelocidade = 0;
 
-// =============================================================================
-// inicializarMotores()
-// =============================================================================
 void inicializarMotores() {
-    // Calcula o PWM aqui, dentro do setup(), onde o runtime já está pronto
-    pwmVelocidade = calcularPWM(200);   // 200 * 4 = 800 (≈78% duty cycle)
+    // Calculamos o PWM (Mesmo não usando agora, validamos a função Assembly)
+    pwmVelocidade = calcularPWM(50);   // 200 * 4 = 800
 
     pinMode(pinoMotor1_F, OUTPUT);
     pinMode(pinoMotor1_B, OUTPUT);
     pinMode(pinoMotor2_F, OUTPUT);
     pinMode(pinoMotor2_B, OUTPUT);
 
+    // Garante que o robô liga completamente parado e seguro
     processarComandoMotor(PARAR);
-    Serial.printf("[MOTORES] Inicializados. PWM calculado: %lu\n", pwmVelocidade);
+    Serial.printf("[MOTORES] Inicializados. Hardware configurado (L9110S).\n");
 }
 
-// =============================================================================
-// processarComandoMotor()
-// =============================================================================
 void processarComandoMotor(Direcao cmd) {
+    // Para segurança na L9110S: Sempre forçamos TUDO a LOW antes de mudar de direção.
+    // Isso evita curto-circuitos instantâneos e picos de corrente na bateria.
+    digitalWrite(pinoMotor1_F, LOW);
+    digitalWrite(pinoMotor1_B, LOW);
+    digitalWrite(pinoMotor2_F, LOW);
+    digitalWrite(pinoMotor2_B, LOW);
+    
+    // Pequeno atraso para dar tempo aos transístores internos descarregarem
+    delay(10); 
+
     switch (cmd) {
         case FRENTE:
-            digitalWrite(pinoMotor1_F, HIGH); digitalWrite(pinoMotor1_B, LOW);
-            digitalWrite(pinoMotor2_F, HIGH); digitalWrite(pinoMotor2_B, LOW);
+            digitalWrite(pinoMotor1_F, HIGH); 
+            digitalWrite(pinoMotor2_F, HIGH); 
             break;
         case TRAS:
-            digitalWrite(pinoMotor1_F, LOW);  digitalWrite(pinoMotor1_B, HIGH);
-            digitalWrite(pinoMotor2_F, LOW);  digitalWrite(pinoMotor2_B, HIGH);
+            digitalWrite(pinoMotor1_B, HIGH);
+            digitalWrite(pinoMotor2_B, HIGH);
             break;
         case PARAR:
         default:
-            digitalWrite(pinoMotor1_F, LOW);  digitalWrite(pinoMotor1_B, LOW);
-            digitalWrite(pinoMotor2_F, LOW);  digitalWrite(pinoMotor2_B, LOW);
+            // Já colocámos a LOW acima. Fica parado em repouso livre.
             break;
     }
 }
@@ -68,14 +59,17 @@ void processarComandoMotor(Direcao cmd) {
 // =============================================================================
 // TaskMotores() — Consumidor da fila de comandos (Core 1)
 // =============================================================================
-void TaskMotores(void* parametros) {
+void TaskMotores(void *pvParameters) {
     Direcao cmd;
     Serial.println("[MOTORES] TaskMotores iniciada no Core 1.");
-
-    for (;;) {
-        if (xQueueReceive(filaComandos, &cmd, portMAX_DELAY) == pdTRUE) {
+    
+    while(1) {
+        // Bloqueia a task até existir um comando pendente na fila
+        if (xQueueReceive(filaComandos, &cmd, portMAX_DELAY)) {
+            Serial.printf("[MOTORES] Comando lógico (%d) retirado da fila.\n", cmd);
+            
+            // Invoca a lógica da ponte H
             processarComandoMotor(cmd);
         }
     }
-    vTaskDelete(NULL);
-}   
+}

@@ -7,5 +7,6 @@
 void inicializarWiFi(const char* ssid, const char* password);
 void iniciarServidorTCP();
 void verificarConexoesTCP();
+void encaminharParaTCP(uint8_t* dados, size_t tamanho);
 
 #endif

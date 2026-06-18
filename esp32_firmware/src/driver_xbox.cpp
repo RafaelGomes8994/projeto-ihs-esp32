@@ -5,6 +5,8 @@
 
 #include "driver_xbox.h"
 #include "driver_motores.h" // Necessário para a Fila e a Enum Direcao
+#include "driver_tcp.h"
+
 
 static volatile EstadoBLE_t estadoAtual = XBOX_CONECTANDO;
 static volatile bool segurancaEstabelecida = false;
@@ -32,51 +34,43 @@ class CallbackSeguranca : public BLESecurityCallbacks {
     }
 };
 
-// =============================================================================
-// Processamento dos Dados do Comando (O Mapeamento Real)
-// =============================================================================
+
 void processarDadosXbox(uint8_t* dados, size_t tamanho) {
-
-#if MODO_SNIFFING == 1
-    Serial.printf("[SNIFF %02d bytes] [ ", tamanho);
-    for (size_t i = 0; i < tamanho; i++) {
-        Serial.printf("%02X ", dados[i]);
-    }
-    Serial.println("]");
-#endif
-
-    // Proteção de memória: Garante que o pacote tem tamanho suficiente
+    // 1. Proteção de memória: Garante que o pacote tem o tamanho mínimo esperado
     if (tamanho < 14) return;
 
-    // A MÁGICA: O byte dos botões A, B, X, Y está exatamente no índice 13!
-    uint8_t maskBotoes = dados[13];
+    // 2. Extrai o Byte Mágico descoberto na Engenharia Reversa
+    uint8_t estadoBotoes = dados[13];
 
-    Direcao cmd = PARAR;
+    Direcao cmdAtual = PARAR; // Comando padrão caso nada esteja pressionado
 
-    // Decodificação via Bitwise AND
-    // 0x08 = Botão X | 0x10 = Botão Y | 0x02 = Botão B
-    if (maskBotoes & 0x08) {         
-        cmd = FRENTE;
-        Serial.println("[XBOX BLE] Botão X pressionado -> FRENTE");
+    // 3. Máscaras Bitwise (Bit-a-Bit) para detetar os botões
+    if (estadoBotoes & 0x08) {         // Se o Bit 3 (0x08) for 1 -> Botão X
+        cmdAtual = FRENTE;
     } 
-    else if (maskBotoes & 0x10) {    
-        cmd = TRAS;
-        Serial.println("[XBOX BLE] Botão Y pressionado -> TRÁS");
+    else if (estadoBotoes & 0x10) {    // Se o Bit 4 (0x10) for 1 -> Botão Y
+        cmdAtual = TRAS;
     }
-    else if (maskBotoes & 0x02) {    
-        cmd = PARAR;
-        Serial.println("[XBOX BLE] Botão B pressionado -> FREIO");
+    else if (estadoBotoes & 0x02) {    // Se o Bit 1 (0x02) for 1 -> Botão B
+        cmdAtual = PARAR; // Freio explícito
     }
+    // O Botão A (0x01) fica livre para programares outra coisa no futuro, como ligar um LED!
 
-    // Envia o comando para a fila dos motores de forma assíncrona
-    if (filaComandos != nullptr) {
-        if (cmd != PARAR) {
-            xQueueSend(filaComandos, &cmd, 0);
-        } else if (maskBotoes == 0 || (maskBotoes & 0x02)) {
-            // Garante que o robô para se soltar tudo ou se carregar no B
-            Direcao stopCmd = PARAR;
-            xQueueSend(filaComandos, &stopCmd, 0);
+    // 4. Lógica Anti-Flood (Para não entupir a Fila do FreeRTOS)
+    static Direcao ultimoCmd = PARAR;
+
+    // Só envia para a fila se o utilizador mudou a ação 
+    // (ex: passou de FRENTE para PARAR ao soltar o botão)
+    if (cmdAtual != ultimoCmd) {
+        if (filaComandos != nullptr) {
+            xQueueSend(filaComandos, &cmdAtual, 0);
+            
+            // Logs de debug para veres a magia a acontecer no Serial Monitor
+            if (cmdAtual == FRENTE) Serial.println("[BLE] Motor: FRENTE (X)");
+            else if (cmdAtual == TRAS) Serial.println("[BLE] Motor: TRAS (Y)");
+            else Serial.println("[BLE] Motor: PARADO");
         }
+        ultimoCmd = cmdAtual;
     }
 }
 

@@ -2,48 +2,39 @@
 #include "driver_motores.h"
 
 WiFiServer server(8080);
-extern QueueHandle_t filaComandos;
+WiFiClient activeClient; // Guardamos a conexão aqui
 
 void inicializarWiFi(const char* ssid, const char* password) {
     WiFi.begin(ssid, password);
-
-    // Timeout de 15 segundos — se a rede não responder, continua sem WiFi.
-    // O rover ainda opera normalmente via BLE (controle Xbox).
-    int tentativas = 0;
-    while (WiFi.status() != WL_CONNECTED && tentativas < 30) {
+    while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
-        tentativas++;
     }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\n[TCP] Wi-Fi conectado! IP: " + WiFi.localIP().toString());
-    } else {
-        Serial.println("\n[TCP] Wi-Fi indisponível — operando só via BLE.");
-    }
+    Serial.println("\n[TCP] IP: " + WiFi.localIP().toString());
 }
 
 void iniciarServidorTCP() {
-    if (WiFi.status() != WL_CONNECTED) return;
     server.begin();
-    Serial.println("[TCP] Servidor TCP iniciado na porta 8080.");
+    server.setNoDelay(true); // Fundamental para telemetria em tempo real
 }
 
 void verificarConexoesTCP() {
-    if (WiFi.status() != WL_CONNECTED) return;
-    WiFiClient client = server.available();
-    if (client) {
-        if (client.available()) {
-            char comando = client.read();
-            Direcao dir = PARAR;
-            switch (comando) {
-                case 'F': dir = FRENTE; break;
-                case 'T': dir = TRAS;   break;
-                default:  dir = PARAR;  break;
-            }
-            xQueueSend(filaComandos, &dir, 0);
-            client.println("OK");
-        }
-        client.stop();
+    // Se não houver cliente ativo, aceitamos uma nova conexão
+    if (!activeClient || !activeClient.connected()) {
+        activeClient = server.available();
+    }
+    
+    // Se o cliente enviou comandos
+    if (activeClient && activeClient.available()) {
+        char comando = activeClient.read();
+        Direcao dir = (comando == 'F') ? FRENTE : (comando == 'T' ? TRAS : PARAR);
+        xQueueSend(filaComandos, &dir, 0);
+    }
+}
+
+// NOVA FUNÇÃO: Envia dados do BLE para o cliente TCP
+void encaminharParaTCP(uint8_t* dados, size_t tamanho) {
+    if (activeClient && activeClient.connected()) {
+        activeClient.write(dados, tamanho);
     }
 }
