@@ -9,7 +9,7 @@
 QueueHandle_t filaComandos = nullptr;
 
 // Substitua pelos dados da sua rede de 2.4GHz
-static const char* WIFI_SSID     = "Yorkshire012@2_4hz"; 
+static const char* WIFI_SSID     = "Zoro"; 
 static const char* WIFI_PASSWORD = "Rafael@12";
 
 void setup() {

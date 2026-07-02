@@ -1,102 +1,108 @@
 // =============================================================================
-// rover_kdriver.c — Linux Kernel Module para Controle TCP do Rover FPV
+// rover_kdriver.c - Driver Ring 0 para o Rover FPV
+// Interceta eventos do Xbox via Input Subsystem e envia para a ESP32 via TCP
 // =============================================================================
 #include <linux/module.h>
-#include <linux/init.h>
+#include <linux/kernel.h>
 #include <linux/input.h>
 #include <linux/net.h>
 #include <linux/in.h>
+#include <linux/inet.h>
 #include <linux/workqueue.h>
 #include <linux/slab.h>
-#include <linux/inet.h>
-#include <net/sock.h>
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Engenharia de Sistemas - IHS UFS");
-MODULE_DESCRIPTION("Driver de Kernel para interceptacao do Xbox e envio TCP");
-MODULE_VERSION("1.0");
+MODULE_AUTHOR("Rafael Gomes Oliveira Santos - IHS");
+MODULE_DESCRIPTION("Driver Kernel Ring 0 para Rover FPV");
 
-// --- CONFIGURAÇÃO DA ESP32 ---
-#define ESP32_IP "192.168.100.34" // IP real da tua ESP32
-#define ESP32_PORT 8080
+// Parâmetro dinâmico para passares o IP do Hotspot ao carregar o módulo
+// Ex: sudo insmod rover_kdriver.ko esp_ip="192.168.100.34"
+static char *esp_ip = "192.168.100.34";
+module_param(esp_ip, charp, 0644);
 
-static struct socket *rover_sock = NULL;
+static struct socket *sock = NULL;
 static struct workqueue_struct *rover_wq;
 
-// Estrutura para a fila de trabalho (Deferred Work)
-struct rover_work_data {
+// Estrutura para transportar o comando da Interrupção para a Workqueue
+struct rover_work {
     struct work_struct work;
-    char comando;
+    char cmd;
 };
 
 // =============================================================================
-// WORKQUEUE: Envio de pacotes TCP fora do contexto de interrupção
+// 1. O TRABALHADOR DE REDE (Roda em Process Context, pode bloquear)
 // =============================================================================
-static void rover_send_work_handler(struct work_struct *work) {
-    struct rover_work_data *data = container_of(work, struct rover_work_data, work);
-    struct kvec iov;
+static void enviar_tcp_worker(struct work_struct *work) {
+    struct rover_work *rw = container_of(work, struct rover_work, work);
+    struct kvec vec;
     struct msghdr msg;
     int ret;
 
-    if (!rover_sock) {
-        kfree(data);
-        return;
+    if (sock) {
+        memset(&msg, 0, sizeof(msg));
+        vec.iov_base = &rw->cmd;
+        vec.iov_len = 1;
+
+        // Envia o caractere via Kernel Sockets
+        ret = kernel_sendmsg(sock, &msg, &vec, 1, 1);
+        if (ret >= 0) {
+            pr_info("[ROVER_KDRIVER] Comando '%c' disparado para %s:8080\n", rw->cmd, esp_ip);
+        }
     }
-
-    memset(&msg, 0, sizeof(msg));
-    iov.iov_base = &data->comando;
-    iov.iov_len  = 1;
-
-    // Função de núcleo para enviar dados por socket
-    ret = kernel_sendmsg(rover_sock, &msg, &iov, 1, 1);
-    if (ret < 0) {
-        pr_err("[ROVER_KDRIVER] Falha ao enviar TCP. Codigo: %d\n", ret);
-    } else {
-        pr_info("[ROVER_KDRIVER] TCP Enviado com sucesso: %c\n", data->comando);
-    }
-
-    kfree(data);
+    
+    kfree(rw); // Liberta a memória alocada na interrupção
 }
 
 // =============================================================================
-// INTERCEPTAÇÃO: Subsistema de Input do Linux
+// 2. INTERCETADOR DE EVENTOS DE HARDWARE (HÍBRIDO: XBOX + TECLADO)
 // =============================================================================
-static void rover_input_event(struct input_handle *handle, unsigned int type, unsigned int code, int value) {
-    // Filtramos apenas pressionamentos de botões (EV_KEY)
-    if (type == EV_KEY) {
-        char cmd = 0;
-        
-        // No Linux, o Xbox mapeia botões para BTN_X, BTN_Y, BTN_B, etc.
-        // value == 1 significa Pressionado. value == 0 significa Solto.
-        if (code == BTN_X && value == 1) {
-            cmd = 'F'; // Frente
-        } else if (code == BTN_Y && value == 1) {
-            cmd = 'T'; // Trás
-        } else if (code == BTN_B && value == 1) {
-            cmd = 'P'; // Parar (Freio)
-        } else if (value == 0 && (code == BTN_X || code == BTN_Y)) {
-            // Se soltou os de movimento, garante que para
-            cmd = 'P'; 
-        }
+static void rover_event(struct input_handle *handle, unsigned int type, unsigned int code, int value) {
+    struct rover_work *rw;
+    char comando = 0;
 
-        if (cmd != 0) {
-            struct rover_work_data *data = kmalloc(sizeof(*data), GFP_ATOMIC);
-            if (data) {
-                data->comando = cmd;
-                INIT_WORK(&data->work, rover_send_work_handler);
-                queue_work(rover_wq, &data->work);
+    // Apenas nos importamos com o evento de "pressionar" o botão/tecla (value == 1)
+    if (type == EV_KEY && value == 1) {
+        
+        // --- 1. MAPEAMENTO DO COMANDO XBOX ---
+        // O driver xpad/bluetooth mapeia os botões para as macros BTN_*
+        if (code == BTN_A || code == BTN_SOUTH) {
+            comando = 'P'; // Botão A (ou Sul) -> PARAR
+        } 
+        else if (code == BTN_X || code == BTN_WEST) {
+            comando = 'F'; // Botão X (ou Oeste) -> FRENTE
+        }
+        else if (code == BTN_Y || code == BTN_NORTH) {
+            comando = 'T'; // Botão Y (ou Norte) -> TRÁS
+        }
+        
+        // --- 2. MAPEAMENTO DO TECLADO DO PC (Backup de Segurança) ---
+        // Permite controlar o robô usando as setas do teclado
+        else if (code == KEY_UP) {
+            comando = 'F'; // Seta Cima -> FRENTE
+        }
+        else if (code == KEY_DOWN) {
+            comando = 'T'; // Seta Baixo -> TRÁS
+        }
+        else if (code == KEY_SPACE) {
+            comando = 'P'; // Barra de Espaço -> PARAR
+        }
+    }
+
+        // Se detetámos um comando válido (seja do Xbox ou do Teclado)
+        if (comando != 0) {
+            // Aloca memória atômica (contexto de interrupção não pode dormir)
+            rw = kmalloc(sizeof(*rw), GFP_ATOMIC);
+            if (rw) {
+                rw->cmd = comando;
+                INIT_WORK(&rw->work, enviar_tcp_worker);
+                queue_work(rover_wq, &rw->work); // Despacha para enviar via TCP
             }
         }
-    }
-}
 
-// Funções obrigatórias para o input_handler acoplar ao dispositivo
-static bool rover_input_match(struct input_handler *handler, struct input_dev *dev) {
-    // Aceita qualquer dispositivo que suporte a tecla BTN_X (Gamepad genérico)
-    return test_bit(BTN_X, dev->keybit); 
-}
-
-static int rover_input_connect(struct input_handler *handler, struct input_dev *dev, const struct input_device_id *id) {
+// =============================================================================
+// 3. BOILERPLATE DO INPUT SUBSYSTEM (Para detetar qualquer comando)
+// =============================================================================
+static int rover_connect(struct input_handler *handler, struct input_dev *dev, const struct input_device_id *id) {
     struct input_handle *handle;
     int error;
 
@@ -105,86 +111,96 @@ static int rover_input_connect(struct input_handler *handler, struct input_dev *
 
     handle->dev = dev;
     handle->handler = handler;
-    handle->name = "rover_handle";
+    handle->name = "rover_handler";
 
     error = input_register_handle(handle);
-    if (error) goto err_free;
+    if (error) goto err_free_handle;
 
     error = input_open_device(handle);
-    if (error) goto err_unregister;
+    if (error) goto err_unregister_handle;
 
-    pr_info("[ROVER_KDRIVER] Gamepad conectado: %s\n", dev->name);
+    pr_info("[ROVER_KDRIVER] Anexado ao dispositivo: %s\n", dev->name);
     return 0;
 
-err_unregister:
+err_unregister_handle:
     input_unregister_handle(handle);
-err_free:
+err_free_handle:
     kfree(handle);
     return error;
 }
 
-static void rover_input_disconnect(struct input_handle *handle) {
+static void rover_disconnect(struct input_handle *handle) {
     input_close_device(handle);
     input_unregister_handle(handle);
     kfree(handle);
 }
 
+// Deteta QUALQUER dispositivo de entrada (Filtramos por botões no rover_event)
 static const struct input_device_id rover_ids[] = {
-    { .driver_info = 1 }, // Captura todos
+    { .driver_info = 1 }, 
     { },
 };
 MODULE_DEVICE_TABLE(input, rover_ids);
 
-static struct input_handler rover_handler = {
-    .event      = rover_input_event,
-    .match      = rover_input_match,
-    .connect    = rover_input_connect,
-    .disconnect = rover_input_disconnect,
-    .name       = "rover_xbox_handler",
-    .id_table   = rover_ids,
+static struct input_handler rover_input_handler = {
+    .event = rover_event,
+    .connect = rover_connect,
+    .disconnect = rover_disconnect,
+    .name = "rover_input_handler",
+    .id_table = rover_ids,
 };
 
 // =============================================================================
-// INIT & EXIT DO KERNEL
+// 4. INICIALIZAÇÃO DO MÓDULO DO KERNEL
 // =============================================================================
-static int __init rover_kdriver_init(void) {
-    struct sockaddr_in dest_addr;
+static int __init rover_init(void) {
+    struct sockaddr_in srv_addr;
     int ret;
 
-    pr_info("[ROVER_KDRIVER] Carregando modulo no Ring 0...\n");
+    pr_info("[ROVER_KDRIVER] Carregando Módulo. Alvo IP: %s\n", esp_ip);
 
+    // Cria a Workqueue para a rede
     rover_wq = create_singlethread_workqueue("rover_wq");
+    if (!rover_wq) return -ENOMEM;
 
-    // 1. Abre Socket no Kernel
-    ret = sock_create(AF_INET, SOCK_STREAM, IPPROTO_TCP, &rover_sock);
-    if (ret < 0) return ret;
-
-    // 2. Conecta à ESP32
-    memset(&dest_addr, 0, sizeof(dest_addr));
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(ESP32_PORT);
-    dest_addr.sin_addr.s_addr = in_aton(ESP32_IP);
-
-    ret = rover_sock->ops->connect(rover_sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr), O_NONBLOCK);
-    if (ret < 0 && ret != -EINPROGRESS) {
-        pr_err("[ROVER_KDRIVER] Falha ao conectar TCP na ESP32.\n");
-        sock_release(rover_sock);
+    // Inicia o Kernel Socket TCP
+    ret = sock_create(PF_INET, SOCK_STREAM, IPPROTO_TCP, &sock);
+    if (ret < 0) {
+        pr_err("[ROVER_KDRIVER] Erro ao criar socket: %d\n", ret);
+        destroy_workqueue(rover_wq);
         return ret;
     }
 
-    // 3. Regista o Input Handler
-    input_register_handler(&rover_handler);
-    pr_info("[ROVER_KDRIVER] Modulo ativo! Escutando Gamepad...\n");
-    return 0;
+    memset(&srv_addr, 0, sizeof(srv_addr));
+    srv_addr.sin_family = AF_INET;
+    srv_addr.sin_port = htons(8080);
+    srv_addr.sin_addr.s_addr = in_aton(esp_ip);
+
+    // Conecta à ESP32
+    ret = sock->ops->connect(sock, (struct sockaddr *)&srv_addr, sizeof(srv_addr), 0);
+    if (ret < 0) {
+        pr_err("[ROVER_KDRIVER] Falha ao conectar à ESP32. Confirme o IP!\n");
+        // Continuamos mesmo assim, pode ser que a ESP32 ligue depois
+    } else {
+        pr_info("[ROVER_KDRIVER] TCP Conectado à ESP32 no Ring 0!\n");
+    }
+
+    // Regista o hook no Subsistema de Entrada
+    return input_register_handler(&rover_input_handler);
 }
 
-static void __exit rover_kdriver_exit(void) {
-    input_unregister_handler(&rover_handler);
+static void __exit rover_exit(void) {
+    input_unregister_handler(&rover_input_handler);
+    
+    if (sock) {
+        sock_release(sock);
+    }
+    
     flush_workqueue(rover_wq);
     destroy_workqueue(rover_wq);
-    if (rover_sock) sock_release(rover_sock);
-    pr_info("[ROVER_KDRIVER] Modulo descarregado e portas fechadas.\n");
+    
+    pr_info("[ROVER_KDRIVER] Módulo descarregado.\n");
 }
 
-module_init(rover_kdriver_init);
-module_exit(rover_kdriver_exit);
+module_init(rover_init);
+module_exit(rover_exit);
