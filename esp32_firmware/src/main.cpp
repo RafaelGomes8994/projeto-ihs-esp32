@@ -4,7 +4,7 @@
 #include <Arduino.h>
 #include "driver_motores.h"
 #include "driver_tcp.h"
-#include "driver_xbox.h" // Trazemos o Bluetooth de volta!
+#include "driver_xbox.h" 
 
 QueueHandle_t filaComandos = nullptr;
 
