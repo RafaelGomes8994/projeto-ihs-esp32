@@ -25,3 +25,7 @@ O sistema possui uma arquitetura híbrida com **Dois Modos de Operação Simult�
 * **Tempo Real:** FreeRTOS (Criação de Tasks, Filas assíncronas para evitar race conditions, alocação de núcleos).
 * **Baixo Nível:** Instruções Assembly para arquitetura do hospedeiro e cálculo matemático em L1.
 * **Sistema Operativo:** Programação Kernel Space, `struct workqueue_struct`, e manipulação nativa de sockets (Kernel Sockets).
+
+
+
+
