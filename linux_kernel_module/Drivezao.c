@@ -4,12 +4,17 @@
 // =============================================================================
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/init.h>
 #include <linux/input.h>
+#include <linux/slab.h>
+#include <linux/workqueue.h>
+#include <linux/kthread.h>
+#include <linux/sched.h>
+#include <linux/delay.h>
 #include <linux/net.h>
 #include <linux/in.h>
 #include <linux/inet.h>
-#include <linux/workqueue.h>
-#include <linux/slab.h>
+#include <linux/socket.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Rafael Gomes Oliveira Santos - IHS");
