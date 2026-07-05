@@ -22,6 +22,7 @@ MODULE_DESCRIPTION("Driver Kernel Ring 0 para Rover FPV");
 
 // Parâmetro dinâmico: passe o IP do Rover ao carregar o módulo
 // Ex: sudo insmod rover_kdriver.ko esp_ip="192.168.100.65"
+static char *esp_ip = "192.168.100.65";
 module_param(esp_ip, charp, 0644);
 
 static struct socket *sock = NULL;
@@ -75,8 +76,8 @@ static void rover_event(struct input_handle *handle,
 
         // --- Mapeamento Xbox (via driver xpad / bluetooth hid) ---
         if      (code == BTN_A     || code == BTN_SOUTH) comando = 'P'; // A -> PARAR
-        else if (code == BTN_Y     || code == BTN_WEST)  comando = 'T'; // X -> FRENTE
-        else if (code == BTN_X     || code == BTN_NORTH) comando = 'F'; // Y -> TRÁS
+        else if (code == BTN_Y     || code == BTN_WEST)  comando = 'T'; // Y -> FRENTE
+        else if (code == BTN_X     || code == BTN_NORTH) comando = 'F'; // X -> TRÁS
 
         // --- Mapeamento de teclado (backup de bancada) ---
         else if (code == KEY_UP)    comando = 'F'; // Seta Cima  -> FRENTE
