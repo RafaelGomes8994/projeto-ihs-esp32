@@ -68,3 +68,6 @@ Testing/
 .cache/
 
 .vscode/
+
+# Credenciais locais do firmware ESP32
+/esp32_firmware/include/wifi_secrets.h

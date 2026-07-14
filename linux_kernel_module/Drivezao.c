@@ -1,6 +1,6 @@
 // =============================================================================
-// rover_kdriver.c - Driver Ring 0 para o Rover FPV
-// Interceta eventos do Xbox via Input Subsystem e envia para a ESP32 via TCP
+// Drivezao.c - Driver de entrada para o Rover FPV
+// Encaminha comandos de um Xbox ou teclado para a ESP32 por TCP.
 // =============================================================================
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -8,9 +8,11 @@
 #include <linux/input.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
-#include <linux/kthread.h>
-#include <linux/sched.h>
-#include <linux/delay.h>
+#include <linux/spinlock.h>
+#include <linux/list.h>
+#include <linux/bitops.h>
+#include <linux/jiffies.h>
+#include <linux/errno.h>
 #include <linux/net.h>
 #include <linux/in.h>
 #include <linux/inet.h>
@@ -18,188 +20,552 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Rafael Gomes Oliveira Santos - IHS");
-MODULE_DESCRIPTION("Driver Kernel Ring 0 para Rover FPV");
+MODULE_DESCRIPTION("Driver de controle TCP para Rover FPV");
 
-// Parâmetro dinâmico: passe o IP do Rover ao carregar o módulo
-// Ex: sudo insmod rover_kdriver.ko esp_ip="192.168.100.65"
-static char *esp_ip = "192.168.100.65";
-module_param(esp_ip, charp, 0644);
+#define DRIVEZAO_DEFAULT_IP            "192.168.100.65"
+#define DRIVEZAO_DEFAULT_PORT          8080
+#define DRIVEZAO_DEFAULT_HEARTBEAT_MS  100
+#define DRIVEZAO_MIN_HEARTBEAT_MS      20
+#define DRIVEZAO_MAX_HEARTBEAT_MS      400
+#define DRIVEZAO_RECONNECT_MS          1000
 
-static struct socket *sock = NULL;
-static struct workqueue_struct *rover_wq;
+#define DRIVEZAO_CMD_FRENTE 'F'
+#define DRIVEZAO_CMD_TRAS   'T'
+#define DRIVEZAO_CMD_PARAR  'P'
 
-// Estrutura para transportar o comando da interrupção para a Workqueue
-struct rover_work {
-    struct work_struct work;
-    char cmd;
+#define DRIVEZAO_HELD_FRENTE BIT(0)
+#define DRIVEZAO_HELD_TRAS   BIT(1)
+
+/* Parametros de carga: esp_ip="192.168.100.65" esp_port=8080 */
+static char *esp_ip = DRIVEZAO_DEFAULT_IP;
+static ushort esp_port = DRIVEZAO_DEFAULT_PORT;
+static uint heartbeat_ms = DRIVEZAO_DEFAULT_HEARTBEAT_MS;
+
+module_param(esp_ip, charp, 0444);
+MODULE_PARM_DESC(esp_ip, "Endereco IPv4 da ESP32");
+module_param(esp_port, ushort, 0444);
+MODULE_PARM_DESC(esp_port, "Porta TCP da ESP32");
+module_param(heartbeat_ms, uint, 0444);
+MODULE_PARM_DESC(heartbeat_ms, "Intervalo entre comandos mantidos, em ms (20-400)");
+
+struct drivezao_handle {
+    struct input_handle handle;
+    struct list_head node;
+    unsigned long held;
+    bool active;
 };
 
-// =============================================================================
-// 1. TRABALHADOR DE REDE (Process Context — pode bloquear)
-// =============================================================================
-static void enviar_tcp_worker(struct work_struct *work)
+static struct socket *esp_sock;
+static struct workqueue_struct *drivezao_wq;
+static struct delayed_work command_work;
+
+/*
+ * O callback de input pode rodar em contexto atomico. Ele apenas atualiza este
+ * estado e agenda command_work; toda operacao de rede ocorre na workqueue.
+ */
+static DEFINE_SPINLOCK(state_lock);
+static LIST_HEAD(drivezao_handles);
+static char requested_command = DRIVEZAO_CMD_PARAR;
+static unsigned int frente_holders;
+static unsigned int tras_holders;
+static bool shutting_down;
+static char last_logged_command;
+
+static bool drivezao_is_movement(char command)
 {
-    struct rover_work *rw = container_of(work, struct rover_work, work);
-    struct kvec vec;
-    struct msghdr msg;
-    int ret;
-
-    if (sock) {
-        memset(&msg, 0, sizeof(msg));
-        vec.iov_base = &rw->cmd;
-        vec.iov_len  = 1;
-
-        ret = kernel_sendmsg(sock, &msg, &vec, 1, 1);
-        if (ret >= 0)
-            pr_info("[ROVER_KDRIVER] Comando '%c' enviado para %s:8080\n",
-                    rw->cmd, esp_ip);
-        else
-            pr_warn("[ROVER_KDRIVER] Falha no envio: %d\n", ret);
-    }
-
-    kfree(rw);  // Libera a memória alocada no contexto de interrupção
+    return command == DRIVEZAO_CMD_FRENTE || command == DRIVEZAO_CMD_TRAS;
 }
 
-// =============================================================================
-// 2. INTERCEPTADOR DE EVENTOS (Contexto de interrupção — não pode dormir)
-// =============================================================================
-static void rover_event(struct input_handle *handle,
-                        unsigned int type,
-                        unsigned int code,
-                        int value)
+static void drivezao_schedule_locked(unsigned long delay)
 {
-    struct rover_work *rw;
-    char comando = 0;
+    if (!shutting_down && drivezao_wq)
+        mod_delayed_work(drivezao_wq, &command_work, delay);
+}
 
-    // Apenas eventos de "pressionar" (value == 1)
-    if (type == EV_KEY && value == 1) {
+static int drivezao_build_address(struct sockaddr_in *address)
+{
+    memset(address, 0, sizeof(*address));
+    address->sin_family = AF_INET;
+    address->sin_port = htons(esp_port);
 
-        // --- Mapeamento Xbox (via driver xpad / bluetooth hid) ---
-        if      (code == BTN_A     || code == BTN_SOUTH) comando = 'P'; // A -> PARAR
-        else if (code == BTN_Y     || code == BTN_WEST)  comando = 'T'; // Y -> FRENTE
-        else if (code == BTN_X     || code == BTN_NORTH) comando = 'F'; // X -> TRÁS
-
-        // --- Mapeamento de teclado (backup de bancada) ---
-        else if (code == KEY_UP)    comando = 'F'; // Seta Cima  -> FRENTE
-        else if (code == KEY_DOWN)  comando = 'T'; // Seta Baixo -> TRÁS
-        else if (code == KEY_SPACE) comando = 'P'; // Espaço     -> PARAR
+    if (!in4_pton(esp_ip, -1, (u8 *)&address->sin_addr.s_addr, '\0', NULL)) {
+        pr_err("[DRIVEZAO] esp_ip invalido: %s\n", esp_ip);
+        return -EINVAL;
     }
 
-    if (comando != 0) {
-        // kmalloc com GFP_ATOMIC: obrigatório em contexto de interrupção
-        rw = kmalloc(sizeof(*rw), GFP_ATOMIC);
-        if (rw) {
-            rw->cmd = comando;
-            INIT_WORK(&rw->work, enviar_tcp_worker);
-            queue_work(rover_wq, &rw->work);
-        }
-    }
-}   // <-- FECHAMENTO DE rover_event (estava faltando no original)
-
-// =============================================================================
-// 3. BOILERPLATE DO INPUT SUBSYSTEM
-// =============================================================================
-static int rover_connect(struct input_handler *handler,
-                         struct input_dev *dev,
-                         const struct input_device_id *id)
-{
-    struct input_handle *handle;
-    int error;
-
-    handle = kzalloc(sizeof(struct input_handle), GFP_KERNEL);
-    if (!handle) return -ENOMEM;
-
-    handle->dev     = dev;
-    handle->handler = handler;
-    handle->name    = "rover_handler";
-
-    error = input_register_handle(handle);
-    if (error) goto err_free_handle;
-
-    error = input_open_device(handle);
-    if (error) goto err_unregister_handle;
-
-    pr_info("[ROVER_KDRIVER] Anexado ao dispositivo: %s\n", dev->name);
     return 0;
-
-err_unregister_handle:
-    input_unregister_handle(handle);
-err_free_handle:
-    kfree(handle);
-    return error;
 }
 
-static void rover_disconnect(struct input_handle *handle)
+/* Called only by command_work, or after command_work was cancelled on exit. */
+static void drivezao_close_socket(void)
 {
-    input_close_device(handle);
-    input_unregister_handle(handle);
-    kfree(handle);
+    if (esp_sock) {
+        sock_release(esp_sock);
+        esp_sock = NULL;
+    }
+
+    last_logged_command = '\0';
 }
 
-// Aceita qualquer dispositivo de entrada; filtramos no rover_event
-static const struct input_device_id rover_ids[] = {
-    { .driver_info = 1 },
-    { },
-};
-MODULE_DEVICE_TABLE(input, rover_ids);
-
-static struct input_handler rover_input_handler = {
-    .event      = rover_event,
-    .connect    = rover_connect,
-    .disconnect = rover_disconnect,
-    .name       = "rover_input_handler",
-    .id_table   = rover_ids,
-};
-
-// =============================================================================
-// 4. INICIALIZAÇÃO DO MÓDULO
-// =============================================================================
-static int __init rover_init(void)
+static int drivezao_connect_tcp(void)
 {
-    struct sockaddr_in srv_addr;
+    struct sockaddr_in address;
+    struct socket *new_sock;
     int ret;
 
-    pr_info("[ROVER_KDRIVER] Carregando. Alvo: %s:8080\n", esp_ip);
+    if (esp_sock)
+        return 0;
 
-    rover_wq = create_singlethread_workqueue("rover_wq");
-    if (!rover_wq) return -ENOMEM;
+    ret = drivezao_build_address(&address);
+    if (ret)
+        return ret;
 
-    ret = sock_create(PF_INET, SOCK_STREAM, IPPROTO_TCP, &sock);
+    ret = sock_create(PF_INET, SOCK_STREAM, IPPROTO_TCP, &new_sock);
     if (ret < 0) {
-        pr_err("[ROVER_KDRIVER] Erro ao criar socket: %d\n", ret);
-        destroy_workqueue(rover_wq);
+        pr_err_ratelimited("[DRIVEZAO] Nao foi possivel criar socket TCP: %d\n",
+                           ret);
         return ret;
     }
 
-    memset(&srv_addr, 0, sizeof(srv_addr));
-    srv_addr.sin_family      = AF_INET;
-    srv_addr.sin_port        = htons(8080);
-    srv_addr.sin_addr.s_addr = in_aton(esp_ip);
-
-    ret = kernel_connect(sock, (struct sockaddr *)&srv_addr,
-                         sizeof(srv_addr), 0);
-    if (ret < 0)
-        pr_warn("[ROVER_KDRIVER] TCP não conectou agora (ESP32 pode ligar depois): %d\n", ret);
-    else
-        pr_info("[ROVER_KDRIVER] TCP conectado à ESP32 no Ring 0!\n");
-
-    return input_register_handler(&rover_input_handler);
-}
-
-static void __exit rover_exit(void)
-{
-    input_unregister_handler(&rover_input_handler);
-
-    if (sock) {
-        sock_release(sock);
-        sock = NULL;
+    ret = kernel_connect(new_sock, (struct sockaddr *)&address,
+                         sizeof(address), 0);
+    if (ret < 0) {
+        pr_warn_ratelimited("[DRIVEZAO] ESP32 indisponivel em %s:%u: %d\n",
+                            esp_ip, esp_port, ret);
+        sock_release(new_sock);
+        return ret;
     }
 
-    flush_workqueue(rover_wq);
-    destroy_workqueue(rover_wq);
-
-    pr_info("[ROVER_KDRIVER] Módulo descarregado.\n");
+    esp_sock = new_sock;
+    pr_info("[DRIVEZAO] TCP conectado a %s:%u\n", esp_ip, esp_port);
+    return 0;
 }
 
-module_init(rover_init);
-module_exit(rover_exit);
+static int drivezao_send_connected(char command)
+{
+    struct kvec vec = {
+        .iov_base = &command,
+        .iov_len = 1,
+    };
+    struct msghdr msg = { };
+    int ret;
+
+    if (!esp_sock)
+        return -ENOTCONN;
+
+    ret = kernel_sendmsg(esp_sock, &msg, &vec, 1, 1);
+    if (ret == 1) {
+        if (command != last_logged_command) {
+            pr_info("[DRIVEZAO] Comando '%c' enviado para %s:%u\n",
+                    command, esp_ip, esp_port);
+            last_logged_command = command;
+        }
+        return 0;
+    }
+
+    if (ret >= 0)
+        ret = -EIO;
+
+    pr_warn_ratelimited("[DRIVEZAO] Falha ao enviar comando '%c': %d\n",
+                        command, ret);
+    return ret;
+}
+
+static int drivezao_send_command(char command)
+{
+    int ret;
+
+    ret = drivezao_connect_tcp();
+    if (ret)
+        return ret;
+
+    ret = drivezao_send_connected(command);
+    if (ret)
+        drivezao_close_socket();
+
+    return ret;
+}
+
+/* Do not open a new connection while the module is being removed. */
+static void drivezao_send_stop_if_connected(void)
+{
+    if (esp_sock && drivezao_send_connected(DRIVEZAO_CMD_PARAR))
+        drivezao_close_socket();
+}
+
+static void drivezao_command_worker(struct work_struct *work)
+{
+    char command;
+    unsigned long flags;
+    unsigned long next_delay;
+    int ret;
+
+    spin_lock_irqsave(&state_lock, flags);
+    if (shutting_down) {
+        spin_unlock_irqrestore(&state_lock, flags);
+        return;
+    }
+    command = requested_command;
+    spin_unlock_irqrestore(&state_lock, flags);
+
+    ret = drivezao_send_command(command);
+
+    spin_lock_irqsave(&state_lock, flags);
+    if (!shutting_down) {
+        /* A state change during TCP I/O must be transmitted without waiting. */
+        if (requested_command != command) {
+            drivezao_schedule_locked(0);
+        } else if (drivezao_is_movement(command)) {
+            next_delay = ret ? msecs_to_jiffies(DRIVEZAO_RECONNECT_MS) :
+                               msecs_to_jiffies(heartbeat_ms);
+            drivezao_schedule_locked(next_delay);
+        }
+    }
+    spin_unlock_irqrestore(&state_lock, flags);
+}
+
+static void drivezao_clear_held_locked(void)
+{
+    struct drivezao_handle *dh;
+
+    list_for_each_entry(dh, &drivezao_handles, node)
+        dh->held = 0;
+
+    frente_holders = 0;
+    tras_holders = 0;
+    requested_command = DRIVEZAO_CMD_PARAR;
+}
+
+static void drivezao_request_stop(struct drivezao_handle *dh)
+{
+    unsigned long flags;
+
+    spin_lock_irqsave(&state_lock, flags);
+    if (!shutting_down && dh->active) {
+        /* A/B or Space is an explicit emergency stop. */
+        drivezao_clear_held_locked();
+        drivezao_schedule_locked(0);
+    }
+    spin_unlock_irqrestore(&state_lock, flags);
+}
+
+static void drivezao_update_direction(struct drivezao_handle *dh,
+                                      char command, bool pressed)
+{
+    unsigned long bit;
+    unsigned int *holders;
+    unsigned long flags;
+    bool send_now = false;
+
+    if (command == DRIVEZAO_CMD_FRENTE) {
+        bit = DRIVEZAO_HELD_FRENTE;
+        holders = &frente_holders;
+    } else {
+        bit = DRIVEZAO_HELD_TRAS;
+        holders = &tras_holders;
+    }
+
+    spin_lock_irqsave(&state_lock, flags);
+    if (shutting_down || !dh->active)
+        goto unlock;
+
+    if (pressed) {
+        /* Ignore EV_KEY autorepeat; a held command is refreshed by heartbeat. */
+        if (dh->held & bit)
+            goto unlock;
+
+        dh->held |= bit;
+        ++*holders;
+        requested_command = command;
+        send_now = true;
+    } else {
+        if (!(dh->held & bit))
+            goto unlock;
+
+        dh->held &= ~bit;
+        if (*holders)
+            --*holders;
+
+        if (requested_command == command && !*holders) {
+            if (command == DRIVEZAO_CMD_FRENTE && tras_holders)
+                requested_command = DRIVEZAO_CMD_TRAS;
+            else if (command == DRIVEZAO_CMD_TRAS && frente_holders)
+                requested_command = DRIVEZAO_CMD_FRENTE;
+            else
+                requested_command = DRIVEZAO_CMD_PARAR;
+
+            /* Release is not delayed until the next heartbeat. */
+            send_now = true;
+        }
+    }
+
+    if (send_now)
+        drivezao_schedule_locked(0);
+
+unlock:
+    spin_unlock_irqrestore(&state_lock, flags);
+}
+
+static void drivezao_detach_handle(struct drivezao_handle *dh)
+{
+    unsigned long flags;
+    bool send_now = false;
+
+    spin_lock_irqsave(&state_lock, flags);
+    if (!dh->active)
+        goto unlock;
+
+    dh->active = false;
+
+    if (dh->held & DRIVEZAO_HELD_FRENTE && frente_holders)
+        --frente_holders;
+    if (dh->held & DRIVEZAO_HELD_TRAS && tras_holders)
+        --tras_holders;
+    dh->held = 0;
+
+    list_del_init(&dh->node);
+
+    if (requested_command == DRIVEZAO_CMD_FRENTE && !frente_holders) {
+        requested_command = tras_holders ? DRIVEZAO_CMD_TRAS :
+                                           DRIVEZAO_CMD_PARAR;
+        send_now = true;
+    } else if (requested_command == DRIVEZAO_CMD_TRAS && !tras_holders) {
+        requested_command = frente_holders ? DRIVEZAO_CMD_FRENTE :
+                                             DRIVEZAO_CMD_PARAR;
+        send_now = true;
+    }
+
+    if (!shutting_down && send_now)
+        drivezao_schedule_locked(0);
+
+unlock:
+    spin_unlock_irqrestore(&state_lock, flags);
+}
+
+static bool drivezao_supported_device(const struct input_dev *dev)
+{
+    bool xbox_like;
+    bool keyboard;
+
+    xbox_like = test_bit(BTN_A, dev->keybit) &&
+                test_bit(BTN_X, dev->keybit) &&
+                test_bit(BTN_Y, dev->keybit);
+    keyboard = test_bit(KEY_UP, dev->keybit) &&
+               test_bit(KEY_DOWN, dev->keybit) &&
+               test_bit(KEY_SPACE, dev->keybit);
+
+    return xbox_like || keyboard;
+}
+
+static void drivezao_event(struct input_handle *handle,
+                           unsigned int type, unsigned int code, int value)
+{
+    struct drivezao_handle *dh =
+        container_of(handle, struct drivezao_handle, handle);
+    char command;
+
+    if (type != EV_KEY || (value != 0 && value != 1))
+        return;
+
+    /*
+     * Xbox: X -> FRENTE, Y -> TRAS, A/B -> PARAR.
+     * Teclado: seta para cima -> FRENTE, para baixo -> TRAS, espaco -> PARAR.
+     */
+    switch (code) {
+    case BTN_X:
+    case KEY_UP:
+        command = DRIVEZAO_CMD_FRENTE;
+        break;
+    case BTN_Y:
+    case KEY_DOWN:
+        command = DRIVEZAO_CMD_TRAS;
+        break;
+    case BTN_A:
+    case BTN_B:
+    case KEY_SPACE:
+        command = DRIVEZAO_CMD_PARAR;
+        break;
+    default:
+        return;
+    }
+
+    if (command == DRIVEZAO_CMD_PARAR) {
+        if (value == 1)
+            drivezao_request_stop(dh);
+        return;
+    }
+
+    drivezao_update_direction(dh, command, value == 1);
+}
+
+static int drivezao_connect_input(struct input_handler *handler,
+                                  struct input_dev *dev,
+                                  const struct input_device_id *id)
+{
+    struct drivezao_handle *dh;
+    unsigned long flags;
+    int ret;
+
+    if (!drivezao_supported_device(dev))
+        return -ENODEV;
+
+    dh = kzalloc(sizeof(*dh), GFP_KERNEL);
+    if (!dh)
+        return -ENOMEM;
+
+    INIT_LIST_HEAD(&dh->node);
+    dh->handle.dev = dev;
+    dh->handle.handler = handler;
+    dh->handle.name = "drivezao_handler";
+
+    ret = input_register_handle(&dh->handle);
+    if (ret)
+        goto err_free_handle;
+
+    spin_lock_irqsave(&state_lock, flags);
+    if (shutting_down) {
+        ret = -ESHUTDOWN;
+    } else {
+        dh->active = true;
+        list_add_tail(&dh->node, &drivezao_handles);
+        ret = 0;
+    }
+    spin_unlock_irqrestore(&state_lock, flags);
+    if (ret)
+        goto err_unregister_handle;
+
+    ret = input_open_device(&dh->handle);
+    if (ret)
+        goto err_detach_handle;
+
+    pr_info("[DRIVEZAO] Entrada anexada: %s\n",
+            dev->name ? dev->name : "sem nome");
+    return 0;
+
+err_detach_handle:
+    drivezao_detach_handle(dh);
+err_unregister_handle:
+    input_unregister_handle(&dh->handle);
+err_free_handle:
+    kfree(dh);
+    return ret;
+}
+
+static void drivezao_disconnect_input(struct input_handle *handle)
+{
+    struct drivezao_handle *dh =
+        container_of(handle, struct drivezao_handle, handle);
+
+    drivezao_detach_handle(dh);
+    input_close_device(handle);
+    input_unregister_handle(handle);
+    kfree(dh);
+}
+
+/* Match only keyboards with the chosen keys or gamepads with the Xbox map. */
+static const struct input_device_id drivezao_ids[] = {
+    {
+        .flags = INPUT_DEVICE_ID_MATCH_EVBIT |
+                 INPUT_DEVICE_ID_MATCH_KEYBIT,
+        .evbit = { BIT_MASK(EV_KEY) },
+        .keybit = {
+            [BIT_WORD(BTN_A)] = BIT_MASK(BTN_A) |
+                                BIT_MASK(BTN_X) |
+                                BIT_MASK(BTN_Y),
+        },
+    },
+    {
+        .flags = INPUT_DEVICE_ID_MATCH_EVBIT |
+                 INPUT_DEVICE_ID_MATCH_KEYBIT,
+        .evbit = { BIT_MASK(EV_KEY) },
+        .keybit = {
+            [BIT_WORD(KEY_SPACE)] = BIT_MASK(KEY_SPACE),
+            [BIT_WORD(KEY_UP)] = BIT_MASK(KEY_UP) | BIT_MASK(KEY_DOWN),
+        },
+    },
+    { },
+};
+MODULE_DEVICE_TABLE(input, drivezao_ids);
+
+static struct input_handler drivezao_input_handler = {
+    .event = drivezao_event,
+    .connect = drivezao_connect_input,
+    .disconnect = drivezao_disconnect_input,
+    .name = "drivezao_input_handler",
+    .id_table = drivezao_ids,
+};
+
+static int __init drivezao_init(void)
+{
+    struct sockaddr_in address;
+    unsigned long flags;
+    int ret;
+
+    if (!esp_port) {
+        pr_err("[DRIVEZAO] esp_port deve estar entre 1 e 65535\n");
+        return -EINVAL;
+    }
+
+    ret = drivezao_build_address(&address);
+    if (ret)
+        return ret;
+
+    if (heartbeat_ms < DRIVEZAO_MIN_HEARTBEAT_MS ||
+        heartbeat_ms > DRIVEZAO_MAX_HEARTBEAT_MS) {
+        pr_warn("[DRIVEZAO] heartbeat_ms=%u invalido; usando %u ms\n",
+                heartbeat_ms, DRIVEZAO_DEFAULT_HEARTBEAT_MS);
+        heartbeat_ms = DRIVEZAO_DEFAULT_HEARTBEAT_MS;
+    }
+
+    INIT_DELAYED_WORK(&command_work, drivezao_command_worker);
+    drivezao_wq = alloc_ordered_workqueue("drivezao_wq", WQ_MEM_RECLAIM);
+    if (!drivezao_wq)
+        return -ENOMEM;
+
+    spin_lock_irqsave(&state_lock, flags);
+    shutting_down = false;
+    drivezao_clear_held_locked();
+    spin_unlock_irqrestore(&state_lock, flags);
+
+    ret = input_register_handler(&drivezao_input_handler);
+    if (ret) {
+        pr_err("[DRIVEZAO] Falha ao registrar handler de input: %d\n", ret);
+        cancel_delayed_work_sync(&command_work);
+        destroy_workqueue(drivezao_wq);
+        drivezao_wq = NULL;
+        return ret;
+    }
+
+    pr_info("[DRIVEZAO] Carregado. Alvo %s:%u; heartbeat %u ms.\n",
+            esp_ip, esp_port, heartbeat_ms);
+    pr_info("[DRIVEZAO] TCP sera conectado sob demanda no primeiro comando.\n");
+    return 0;
+}
+
+static void __exit drivezao_exit(void)
+{
+    unsigned long flags;
+
+    /* Block new schedules before unregistering input and draining the worker. */
+    spin_lock_irqsave(&state_lock, flags);
+    shutting_down = true;
+    drivezao_clear_held_locked();
+    spin_unlock_irqrestore(&state_lock, flags);
+
+    input_unregister_handler(&drivezao_input_handler);
+
+    /* No worker may touch esp_sock after this point. */
+    cancel_delayed_work_sync(&command_work);
+    drivezao_send_stop_if_connected();
+    drivezao_close_socket();
+
+    if (drivezao_wq) {
+        destroy_workqueue(drivezao_wq);
+        drivezao_wq = NULL;
+    }
+
+    pr_info("[DRIVEZAO] Modulo descarregado.\n");
+}
+
+module_init(drivezao_init);
+module_exit(drivezao_exit);

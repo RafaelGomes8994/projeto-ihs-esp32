@@ -7,7 +7,7 @@
 MODULO    := Drivezao
 ESP_IP    := 192.168.100.65
 ESP_PORT  := 8080
-LIMIAR    := 8192
+HEARTBEAT_MS := 100
 MAC_XBOX  := 14:CB:65:8C:9C:55
 
 # --- Paths do kernel build ---
@@ -30,7 +30,7 @@ obj-m += $(MODULO).o
 # TARGETS PRINCIPAIS
 # ==============================================================================
 
-.PHONY: all clean load unload reload status log watch check bt-pair help
+.PHONY: all clean load unload reload status log watch dmesg-full check bt-pair bt-status help
 
 # --- Compilação ---
 all: _check_headers
@@ -51,10 +51,10 @@ load: all
 	@printf "║  Carregando Drivezao no kernel...    ║\n"
 	@printf "╠══════════════════════════════════════╣\n"
 	@printf "║  ESP32 : $(ESP_IP):$(ESP_PORT)           ║\n"
-	@printf "║  Limiar: $(LIMIAR)                         ║\n"
+	@printf "║  Heartbeat: $(HEARTBEAT_MS) ms                    ║\n"
 	@printf "╚══════════════════════════════════════╝\n"
 	@printf "$(RESET)\n"
-	@sudo insmod $(MODULO).ko esp_ip="$(ESP_IP)" limiar=$(LIMIAR)
+	@sudo insmod $(MODULO).ko esp_ip="$(ESP_IP)" esp_port=$(ESP_PORT) heartbeat_ms=$(HEARTBEAT_MS)
 	@if lsmod | grep -q "^$(MODULO)"; then \
 		printf "$(BOLD)$(GREEN)[DRIVEZAO] Modulo ativo no kernel!$(RESET)\n"; \
 	else \
@@ -224,7 +224,7 @@ help:
 	@printf "╠══════════════════════════════════════════════════════════╣\n"
 	@printf "║  PARAMETROS SOBREPONIVEIS                                ║\n"
 	@printf "║    make load ESP_IP=192.168.1.50                         ║\n"
-	@printf "║    make load LIMIAR=10000                                ║\n"
+	@printf "║    make load ESP_PORT=8080 HEARTBEAT_MS=100              ║\n"
 	@printf "╠══════════════════════════════════════════════════════════╣\n"
 	@printf "║  Alvo atual: $(ESP_IP):$(ESP_PORT)                       ║\n"
 	@printf "║  Kernel:     $(shell uname -r)                 ║\n"

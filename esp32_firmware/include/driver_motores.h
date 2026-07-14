@@ -1,6 +1,5 @@
 // =============================================================================
-// driver_motores.h — Driver de Controle dos Motores DC (Ponte H L298N/L293D)
-// Projeto: Rover FPV | Disciplina: IHS — Prof. Bruno Prado / UFS
+// driver_motores.h - Controle seguro dos motores pela ponte H L9110S
 // =============================================================================
 
 #ifndef DRIVER_MOTORES_H
@@ -10,39 +9,51 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
-// =============================================================================
-// Fila de comandos compartilhada entre produtores e consumidor:
-//   Produtores: driver_tcp.cpp (comandos via rede) e driver_xbox.cpp (BLE)
-//   Consumidor: TaskMotores() — lê e aciona os pinos da ponte H
-//
-// A variável é DEFINIDA em main.cpp (QueueHandle_t filaComandos;)
-// e DECLARADA como extern aqui para todos os módulos que incluírem este header.
-// =============================================================================
+// O rover aceita somente estes tres estados de movimento. Os valores explicitos
+// tambem deixam os logs e o protocolo de depuracao estaveis.
+enum class Direcao : uint8_t {
+    FRENTE = 0,
+    TRAS   = 1,
+    PARAR  = 2
+};
+
+// Identifica quem produziu o comando. A TaskMotores usa esta informacao para
+// impedir que BLE e TCP alternem a direcao a cada pacote recebido.
+enum class FonteComando : uint8_t {
+    SISTEMA = 0,
+    TCP     = 1,
+    BLE     = 2
+};
+
+// A fila guarda sempre o estado mais recente, nunca uma sequencia atrasada de
+// movimentos. recebidoEmMs permite descartar comandos que envelheceram antes
+// de a task poder processa-los.
+struct ComandoMotor {
+    Direcao direcao;
+    FonteComando fonte;
+    uint32_t recebidoEmMs;
+};
+
+// Definida em main.cpp. Deve ser criada com exatamente uma posicao, pois os
+// produtores usam xQueueOverwrite para manter apenas o ultimo estado.
 extern QueueHandle_t filaComandos;
 
-// =============================================================================
-// Enum de direções — vocabulário do robô
-// =============================================================================
-typedef enum {
-    FRENTE,
-    TRAS,
-    PARAR
-} Direcao;
+// Tanto o driver TCP quanto o BLE enviam heartbeat a cada 100 ms. Sem um
+// heartbeat valido por 500 ms, a TaskMotores para fisicamente o rover.
+constexpr uint32_t TEMPO_LIMITE_COMANDO_MS = 500;
 
-// =============================================================================
-// Protótipos das funções públicas
-// =============================================================================
+// Publica um comando sem bloquear. PARAR possui tratamento adicional para nao
+// ser perdido caso um comando de movimento sobrescreva a fila logo em seguida.
+bool enviarComandoMotor(Direcao direcao, FonteComando fonte);
 
-// Configura os pinos da ponte H como OUTPUT e para o robô.
-// Chamar no setup() antes de criar as Tasks.
+// Configura LEDC e os pinos da ponte H, iniciando sempre em repouso.
 void inicializarMotores();
 
-// Aciona os pinos da ponte H conforme a direção solicitada.
-// Chamada internamente pela TaskMotores — não chamar diretamente do main.
+// Aciona a ponte H. E chamado internamente pela TaskMotores; nao use esta
+// funcao como atalho para contornar a arbitragem ou o watchdog.
 void processarComandoMotor(Direcao cmd);
 
-// Task FreeRTOS que consome a filaComandos e aciona os motores.
-// Fixar no Core 1 com xTaskCreatePinnedToCore(..., 1).
+// Consumidor da fila e responsavel pelo watchdog e pela arbitragem das fontes.
 void TaskMotores(void* parametros);
 
-#endif // DRIVER_MOTORES_H
+#endif  // DRIVER_MOTORES_H

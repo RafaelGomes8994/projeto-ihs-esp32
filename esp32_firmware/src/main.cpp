@@ -1,55 +1,59 @@
 // =============================================================================
-// main.cpp — Arquitetura Híbrida: TCP Kernel + Xbox BLE Direto
+// main.cpp - Rover: TCP seguro, telemetria separada e controle BLE
 // =============================================================================
+
 #include <Arduino.h>
+
 #include "driver_motores.h"
 #include "driver_tcp.h"
-#include "driver_xbox.h" 
+#include "driver_xbox.h"
+#include "wifi_config.h"
 
 QueueHandle_t filaComandos = nullptr;
-
-// Substitua pelos dados da sua rede de 2.4GHz
-static const char* WIFI_SSID     = "Yorkshire012@2_4hz"; 
-static const char* WIFI_PASSWORD = "Rafael@12";
 
 void setup() {
     Serial.begin(115200);
     delay(500);
+    Serial.println("\n[MAIN] Rover iniciando (TCP + BLE com fail-safe)...");
 
-    Serial.println("\n[MAIN] Rover FPV iniciando (MODO HÍBRIDO TCP + BLE)...");
-
-    // 1. Cria a fila de comandos (Protegida contra Condições de Corrida)
-    filaComandos = xQueueCreate(10, sizeof(Direcao));
+    // A fila unitario/overwrite representa estado, nao uma lista de movimentos.
+    filaComandos = xQueueCreate(1, sizeof(ComandoMotor));
     if (filaComandos == nullptr) {
-        Serial.println("[MAIN] ERRO FATAL: falha ao criar filaComandos!");
-        while (true) { delay(1000); }
+        Serial.println("[MAIN] ERRO FATAL: falha ao criar fila de comandos.");
+        while (true) {
+            delay(1000);
+        }
     }
 
-    // 2. Inicializa os pinos físicos
     inicializarMotores();
 
-    // 3. LIGA O WI-FI PRIMEIRO (Crucial para a Coexistência de Antena)
-    Serial.println("[MAIN] Iniciando Wi-Fi...");
-    inicializarWiFi(WIFI_SSID, WIFI_PASSWORD);
-    iniciarServidorTCP();
+    // O watchdog de motores deve existir antes de qualquer produtor de comando.
+    if (xTaskCreatePinnedToCore(TaskMotores, "Motores", 3072, nullptr, 3,
+                                nullptr, 1) != pdPASS) {
+        Serial.println("[MAIN] ERRO FATAL: nao foi possivel criar TaskMotores.");
+        while (true) {
+            delay(1000);
+        }
+    }
 
-    // 4. LIGA O BLUETOOTH DEPOIS
-    Serial.println("[MAIN] Iniciando Bluetooth...");
+    // Wi-Fi e iniciado sem espera bloqueante. Se a rede estiver indisponivel,
+    // verificarConexoesTCP() reconecta em segundo plano e o BLE segue ativo.
+    inicializarWiFi(ROVER_WIFI_SSID, ROVER_WIFI_PASSWORD);
+    if (!iniciarServidorTCP()) {
+        Serial.println("[MAIN] Telemetria indisponivel: fila TCP nao criada.");
+    }
+
     inicializarBLE();
+    if (xTaskCreatePinnedToCore(TaskXbox, "XboxBLE", 8192, nullptr, 1,
+                                nullptr, 0) != pdPASS) {
+        Serial.println("[MAIN] ERRO: Task Xbox nao criada; TCP permanece disponivel.");
+    }
 
-    // 5. Inicia as Tasks do FreeRTOS
-    // Task dos Motores roda no Core 1 (Prioridade alta para não engasgar)
-    xTaskCreatePinnedToCore(TaskMotores, "Motores", 2048, NULL, 2, NULL, 1);
-    
-    // Task do Xbox BLE roda no Core 0 (Isolada do processamento principal)
-    xTaskCreatePinnedToCore(TaskXbox, "XboxBLE", 8192, NULL, 1, NULL, 0);
-    
-    Serial.println("[MAIN] Setup concluído. Escutando PC (Rede) e Comando (BLE)...");
+    Serial.println("[MAIN] Pronto: comandos TCP 8080, telemetria TCP 8081 e BLE.");
 }
 
 void loop() {
-    // O Loop principal do Arduino fica encarregado de escutar a rede
-    // Se chegar TCP, ele manda para a Fila. Se não chegar, passa reto.
-    verificarConexoesTCP(); 
-    delay(10);
+    // Este e o unico contexto que acessa WiFiClient. Callbacks BLE so usam filas.
+    verificarConexoesTCP();
+    delay(5);
 }

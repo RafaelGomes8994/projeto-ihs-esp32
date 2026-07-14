@@ -1,41 +1,34 @@
 // =============================================================================
-// driver_xbox.h — Driver BLE/HID para Controle Xbox Series S
-// Projeto: Rover FPV | Disciplina: IHS — Prof. Bruno Prado / UFS
+// driver_xbox.h - Cliente BLE/HID para o controle Xbox
 // =============================================================================
 
 #ifndef DRIVER_XBOX_H
 #define DRIVER_XBOX_H
 
 #include <Arduino.h>
-#include <BLEDevice.h>
 #include <BLEClient.h>
+#include <BLEDevice.h>
+#include "wifi_config.h"
 
-// =============================================================================
-// Configurações Globais do Bluetooth
-// =============================================================================
-// Substitui o MAC abaixo pelo endereço MAC real do teu comando Xbox
+// Pode ser sobrescrito em wifi_secrets.h ou por uma build flag sem editar o
+// driver. O endereco deve ser o MAC BLE do controle Xbox pareado.
+#ifndef MAC_XBOX
 #define MAC_XBOX "14:cb:65:8c:9c:55"
+#endif
 
-// UUIDs padrão do Perfil HID (Human Interface Device)
 #define UUID_SERVICO_HID        "00001812-0000-1000-8000-00805f9b34fb"
 #define UUID_CARACTERISTICA_HID "00002a4d-0000-1000-8000-00805f9b34fb"
 
-#define INTERVALO_RECONEXAO_MS  3000
-#define MODO_SNIFFING           0 // Altera para 1 se quiseres ver os bytes brutos no terminal
+constexpr uint32_t INTERVALO_RECONEXAO_MS = 3000;
+constexpr uint32_t INTERVALO_HEARTBEAT_BLE_MS = 100;
 
-// =============================================================================
-// Estados da máquina de estados BLE
-// =============================================================================
-typedef enum {
-    XBOX_CONECTANDO,    // A tentar estabelecer conexão BLE
-    XBOX_CONECTADO,     // Subscrito às notificações e pronto
-    XBOX_DESCONECTADO   // Ligação perdida, a aguardar reconexão
-} EstadoBLE_t;
+enum class EstadoBLE_t : uint8_t {
+    CONECTANDO,
+    CONECTADO,
+    DESCONECTADO
+};
 
-// =============================================================================
-// Protótipos Públicos
-// =============================================================================
 void inicializarBLE();
 void TaskXbox(void* parametros);
 
-#endif // DRIVER_XBOX_H
+#endif  // DRIVER_XBOX_H

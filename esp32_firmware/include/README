@@ -1,15 +1,40 @@
-📁 projeto_robo_ihs
- ├── 📁 include
- │    ├── camera_server.h
- │    ├── xbox_driver.h
- |    ├── driver_tcp.h
- │    ├── motores.h
- │    └── web_page.h
- ├── 📁 src
- │    ├── main.cpp
- │    ├── camera_server.cpp
- |    ├── driver_tcp.cpp
- │    ├── xbox_driver.cpp
- │    ├── motores.cpp
- │    └── calculo_pwm.S      <-- (Requisito: Código de montagem)
- └── 📄 platformio.ini
+# Contratos dos cabeçalhos do firmware
+
+Esta pasta concentra as interfaces públicas entre os módulos do firmware. Ela não deve conter senhas de Wi-Fi nem detalhes privados de uma rede.
+
+| Arquivo | Responsabilidade |
+| --- | --- |
+| `driver_motores.h` | Vocabulário `Direcao`, fila compartilhada e tarefa que aciona a L9110S. |
+| `driver_tcp.h` | Wi-Fi, serviço de comandos TCP e serviço de telemetria TCP. |
+| `driver_xbox.h` | Conexão BLE/HID do controle Xbox e a tarefa de recepção. |
+
+## Contrato de comandos
+
+`Direcao` é o tipo trocado entre os produtores (TCP e BLE) e o consumidor `TaskMotores()`. Os valores lógicos atuais são:
+
+| Valor | Direção | Comando de rede |
+| ---: | --- | --- |
+| `0` | `FRENTE` | `F` |
+| `1` | `TRAS` | `T` |
+| `2` | `PARAR` | `P` |
+
+O código que recebe dados externos deve validar o comando antes de colocá-lo na fila. Uma solicitação de parada, desconexão ou timeout deve levar o driver à condição segura: todas as entradas da ponte H em nível baixo.
+
+## Serviços TCP
+
+O firmware expõe dois serviços independentes:
+
+| Porta | Papel | Formato |
+| ---: | --- | --- |
+| `8080` | comando | Um byte ASCII: `F`, `T` ou `P`. |
+| `8081` | telemetria | Repetição de `[uint16 big-endian tamanho][payload HID bruto]`. |
+
+O cabeçalho da telemetria tem exatamente dois bytes e o payload precisa ter de 1 a `MAX_TAMANHO_PACOTE` (512) bytes. Não envie payload HID bruto na porta 8080 e não trate `read()`/`recv()` como se retornassem um pacote TCP completo. Um cliente pode receber vários frames em sequência e precisa manter os bytes excedentes em buffer.
+
+## L9110S e segurança elétrica
+
+O driver de motores usa os pares `GPIO12/GPIO13` (canal A) e `GPIO15/GPIO14` (canal B). Cada par é conectado às entradas `IA/IB` de um canal da L9110S; os motores vão nas saídas `OA/OB` correspondentes.
+
+Antes de inverter a direção, o driver deve desativar as quatro entradas para evitar uma inversão brusca. Para controle de velocidade, o valor de duty-cycle deve ser aplicado por PWM/LEDC, nunca passado diretamente a `digitalWrite()`.
+
+As fontes da ESP32 e da ponte podem ser separadas, desde que o GND seja comum. GPIO12 e GPIO15 podem afetar o boot em algumas placas ESP32-CAM, portanto a ligação da ponte não pode forçar níveis indevidos durante a inicialização.
