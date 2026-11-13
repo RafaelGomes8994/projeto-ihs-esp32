@@ -4,7 +4,7 @@
 # ==============================================================================
 
 # --- Configuração do alvo ---
-MODULO    := Drivezao
+MODULO    := rover_input_driver
 ESP_IP    := 192.168.100.65
 ESP_PORT  := 8080
 HEARTBEAT_MS := 100
