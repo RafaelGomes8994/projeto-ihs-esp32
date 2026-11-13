@@ -1,315 +1,213 @@
 # Rover IHS com ESP32
 
-Projeto da disciplina de Interface Hardware/Software para controlar um rover 2WD
-com ESP32-CAM, ponte H L9110S, controle Xbox via BLE, controle alternativo via
-TCP a partir de um modulo de kernel Linux e telemetria HID pela rede.
+![ESP32-CAM](https://img.shields.io/badge/MCU-ESP32--CAM-E7352C?style=for-the-badge&logo=espressif&logoColor=white)
+![FreeRTOS](https://img.shields.io/badge/RTOS-FreeRTOS-00979D?style=for-the-badge)
+![Xtensa ASM](https://img.shields.io/badge/Assembly-Xtensa-283272?style=for-the-badge)
+![Linux Kernel](https://img.shields.io/badge/Linux-Kernel%20Module-FCC624?style=for-the-badge&logo=linux&logoColor=black)
+![PlatformIO](https://img.shields.io/badge/PlatformIO-Build-FF7F00?style=for-the-badge&logo=platformio&logoColor=white)
+![Python](https://img.shields.io/badge/Python-HID%20Telemetry-3776AB?style=for-the-badge&logo=python&logoColor=white)
 
-O sistema foi desenvolvido em tres partes:
+> **Summary (EN):** 2WD Rover controlled via **Xbox BLE HID** and a custom **Linux Kernel Module (`Drivezao`)** over TCP. The ESP32-CAM firmware runs **FreeRTOS** task/queue arbitration, an **Xtensa Assembly** PWM routine (`calculo_pwm.S`), H-bridge deadtime/watchdog protection, and real-time binary HID telemetry over TCP for Python diagnostics.
 
-- firmware da ESP32, responsavel por BLE, Wi-Fi, TCP, telemetria e motores;
-- `Drivezao`, modulo de kernel Linux que le eventos de entrada e envia comandos
-  TCP para a ESP32;
-- scripts Python para capturar, visualizar e analisar os reports HID do controle.
+Projeto da disciplina de Interface Hardware/Software para controlar um rover 2WD com ESP32-CAM, ponte H L9110S, controle Xbox via BLE, controle alternativo via TCP a partir de um módulo de kernel Linux e telemetria HID pela rede.
 
-## Estrutura do Repositorio
+O sistema foi desenvolvido em três partes:
+
+- **Firmware da ESP32 (`esp32_firmware/`):** responsável por FreeRTOS, BLE HID, Wi-Fi/TCP, telemetria e controle de motores;
+- **Módulo de Kernel Linux (`linux_kernel_module/Drivezao.c`):** driver em kernel space que lê eventos de entrada (`input_handler`) e envia comandos TCP via `workqueue` para a ESP32;
+- **Scripts Python (`analise_Bytes_Controle/`):** captura, visualização e análise dos reports HID do controle.
+
+## Estrutura do Repositório
 
 ```text
-esp32_firmware/          Firmware da ESP32-CAM
-linux_kernel_module/     Modulo de kernel Linux Drivezao
-analise_Bytes_Controle/  Scripts Python de telemetria e analise HID
+esp32_firmware/          Firmware da ESP32-CAM (PlatformIO + Arduino/FreeRTOS + Xtensa ASM)
+linux_kernel_module/     Módulo de kernel Linux (Drivezao.c + Makefile)
+analise_Bytes_Controle/  Scripts Python de telemetria e análise HID
 ```
 
 Arquivos principais:
 
-| Arquivo | Funcao |
-| --- | --- |
-| `esp32_firmware/src/main.cpp` | Inicializa fila, motores, Wi-Fi/TCP e BLE. |
-| `esp32_firmware/src/driver_motores.cpp` | Controla a ponte H L9110S, PWM, watchdog e arbitragem. |
-| `esp32_firmware/src/driver_tcp.cpp` | Mantem Wi-Fi, servidor de comandos e servidor de telemetria. |
-| `esp32_firmware/src/driver_xbox.cpp` | Conecta no controle Xbox por BLE/HID e interpreta botoes. |
-| `esp32_firmware/src/calculo_pwm.S` | Rotina Assembly Xtensa para calcular o duty cycle do PWM. |
-| `esp32_firmware/include/wifi_config.h` | Carrega credenciais locais sem expor senha no repositorio. |
+| Arquivo | Função |
+| :--- | :--- |
+| `esp32_firmware/src/main.cpp` | Inicializa fila FreeRTOS, motores, Wi-Fi/TCP e task BLE. |
+| `esp32_firmware/src/driver_motores.cpp` | Controla a ponte H L9110S, PWM, watchdog (500 ms) e arbitragem. |
+| `esp32_firmware/src/driver_tcp.cpp` | Mantém Wi-Fi, servidor de comandos (`8080`) e servidor de telemetria (`8081`). |
+| `esp32_firmware/src/driver_xbox.cpp` | Conecta ao controle Xbox via BLE/HID e interpreta botões. |
+| `esp32_firmware/src/calculo_pwm.S` | Rotina em **Assembly Xtensa** para converter duty cycle (`0..255` → `0..1020`). |
+| `esp32_firmware/include/wifi_config.h` | Carrega credenciais locais sem expor senha no repositório. |
 | `esp32_firmware/include/wifi_secrets.example.h` | Modelo para criar o arquivo local de Wi-Fi. |
-| `linux_kernel_module/Drivezao.c` | Driver Linux que envia comandos TCP para o rover. |
-| `linux_kernel_module/Makefile` | Compila, carrega, remove e monitora o modulo Linux. |
+| `linux_kernel_module/Drivezao.c` | Driver Linux (`input_handler` + `workqueue` + TCP socket) para o rover. |
+| `linux_kernel_module/Makefile` | Compila, carrega, remove e monitora o módulo Linux. |
 | `analise_Bytes_Controle/protocolo_telemetria.py` | Implementa o leitor do protocolo de telemetria TCP. |
 | `analise_Bytes_Controle/demonstracaoTCP.py` | Mostra os reports HID recebidos em tempo real. |
 | `analise_Bytes_Controle/xbox_sniff.py` | Grava payloads HID recebidos pela telemetria. |
-| `analise_Bytes_Controle/analisar_dump.py` | Analisa diferencas entre dumps HID salvos. |
+| `analise_Bytes_Controle/analisar_dump.py` | Analisa diferenças entre dumps HID salvos. |
 
 ## Arquitetura
 
-O rover possui dois caminhos de controle que chegam ao mesmo consumidor de
-comandos no firmware:
+```mermaid
+flowchart LR
+    Xbox["Controle Xbox (BLE HID)"] -->|"Notificações BLE"| ESP_BLE["driver_xbox (ESP32)"]
+    Host["Host Linux (Xbox / Teclado)"] -->|"input_handler + workqueue"| LKM["Drivezao.ko (Kernel Space)"]
+    LKM -->|"TCP :8080 (F / T / P)"| ESP_TCP["driver_tcp (ESP32)"]
 
-```text
-Controle Xbox BLE ------\
-                         \
-                          -> fila FreeRTOS -> TaskMotores -> L9110S -> motores
-Drivezao Linux -> TCP ---/
+    ESP_BLE -->|"Comando (Overwrite)"| Queue["Fila FreeRTOS (len=1)"]
+    ESP_TCP -->|"Comando (Overwrite)"| Queue
+    Queue --> TaskM["TaskMotores + Watchdog 500ms"]
+    TaskM -->|"calculo_pwm.S (Xtensa ASM)"| PWM["LEDC PWM (20 kHz / 10-bit)"]
+    PWM --> HBridge["Ponte H L9110S"] --> Motors["Motores 2WD"]
 
-Controle Xbox BLE -> ESP32 -> TCP 8081 -> scripts Python
+    ESP_BLE -->|"Payload HID"| TQueue["Fila de Telemetria"]
+    TQueue -->|"TCP :8081 ([uint16 len][HID])"| Py["Scripts Python (analise_Bytes_Controle)"]
 ```
 
-A ESP32 recebe comandos de duas fontes:
-
-- BLE direto do controle Xbox;
-- TCP vindo do `Drivezao`, rodando em um host Linux.
-
-Mesmo com duas fontes, os motores sao controlados por uma unica task. Isso evita
-que BLE e TCP escrevam diretamente nos GPIOs ao mesmo tempo.
+Mesmo com duas fontes de comando (BLE direto e TCP vindo do módulo de kernel Linux), os motores são controlados por uma única task FreeRTOS (`TaskMotores`), evitando condições de corrida nos GPIOs.
 
 ## Como Foi Feito
 
 ### Firmware ESP32
 
-O firmware usa Arduino para ESP32 e FreeRTOS. A inicializacao principal cria uma
-fila de comandos com uma posicao, configura os motores, inicia a rede, cria os
-servidores TCP e inicia a task responsavel pelo controle Xbox BLE.
+O firmware usa Arduino para ESP32 e FreeRTOS. A inicialização principal cria uma fila de comandos com uma posição (`xQueueOverwrite`), configura os motores, inicia a rede, sobe os servidores TCP e cria a task responsável pelo controle Xbox BLE.
 
-A fila de comandos guarda sempre o estado mais recente. Em vez de acumular uma
-lista de movimentos, o firmware trabalha com estado: frente, tras ou parar.
-Isso evita que comandos antigos sejam executados atrasados.
+A fila de comandos guarda sempre o estado mais recente (`F`, `T` ou `P`) para evitar que comandos antigos sejam executados com atraso.
 
 ### Controle dos Motores
 
-A ponte H usada e uma L9110S. A pinagem atual no firmware e:
+A ponte H usada é uma **L9110S**. Pinagem atual no firmware:
 
 | Sinal | GPIO |
-| --- | --- |
+| :--- | :--- |
 | Motor 1 frente | `13` |
-| Motor 1 tras | `14` |
+| Motor 1 trás | `14` |
 | Motor 2 frente | `4` |
-| Motor 2 tras | `15` |
+| Motor 2 trás | `15` |
 
-O PWM usa quatro canais LEDC, frequencia de `20 kHz` e resolucao de `10 bits`.
-A rotina `calcularPWM`, escrita em Assembly Xtensa, recebe uma entrada de
-`0..255` e converte para `0..1020`, faixa usada pelo LEDC.
+O PWM usa quatro canais LEDC, frequência de `20 kHz` e resolução de `10 bits`. A rotina `calcularPWM`, escrita em **Assembly Xtensa**, converte entrada `0..255` para `0..1020`.
 
-O controle dos motores inclui:
-
-- inicializacao sempre em repouso;
-- parada fisica antes de mudar de direcao;
-- tempo morto de `500 us` durante reversao;
-- watchdog de `500 ms` para parar se o heartbeat sumir;
-- prioridade para qualquer comando de parada;
-- arbitragem entre comandos vindos de BLE e TCP.
+Recursos de segurança implementados:
+- Inicialização sempre em repouso;
+- Parada física antes de inverter direção;
+- Tempo morto (*deadtime*) de `500 us` durante reversão;
+- Watchdog de `500 ms` para parar os motores se o heartbeat cessar;
+- Prioridade máxima para qualquer comando de parada;
+- Arbitragem entre comandos BLE e TCP.
 
 ### Controle Xbox por BLE
 
-O firmware se conecta ao controle Xbox usando o servico HID BLE. Ele procura a
-caracteristica de input report com notificacao, registra callback e interpreta
-os bytes recebidos.
+O firmware conecta ao controle Xbox via serviço HID BLE, localiza a característica de *input report* com notificação, registra o callback e interpreta os bytes recebidos:
 
-Mapeamento usado no controle:
-
-| Botao | Acao |
-| --- | --- |
+| Botão | Ação |
+| :--- | :--- |
 | `X` | Frente |
-| `Y` | Tras |
+| `Y` | Trás |
 | `B` | Parar |
 
-Os reports HID tambem sao enviados para uma fila de telemetria. O callback BLE
-nao acessa diretamente o TCP; ele apenas copia os dados para fila, evitando
-bloqueio dentro da pilha Bluetooth.
+Os reports HID são copiados para uma fila de telemetria sem bloquear a pilha Bluetooth.
 
 ### TCP
 
-A ESP32 usa duas portas TCP:
+A ESP32 expõe duas portas TCP:
 
-| Porta | Uso |
-| --- | --- |
-| `8080` | Comandos de movimento |
-| `8081` | Telemetria HID |
+| Porta | Uso | Formato |
+| :--- | :--- | :--- |
+| `8080` | Comandos de movimento | `F` (Frente), `T` (Trás), `P` (Parar) |
+| `8081` | Telemetria HID | `[uint16 big-endian tamanho][payload HID bruto]` |
 
-Os comandos aceitos na porta `8080` sao:
+### Módulo de Kernel Linux (`Drivezao`)
 
-| Byte | Acao |
-| --- | --- |
-| `F` | Frente |
-| `T` | Tras |
-| `P` | Parar |
+O `Drivezao` é um módulo de kernel Linux em C que registra um `input_handler`, detecta controles Xbox ou teclados compatíveis e envia comandos TCP em kernel space via `workqueue` (mantendo o callback de input não-bloqueante). Enquanto o comando está pressionado, envia heartbeats periódicos; ao soltar, envia `P` imediatamente.
 
-A telemetria usa frames com cabecalho de tamanho:
+| Entrada | Ação |
+| :--- | :--- |
+| Xbox `X` ou Seta ↑ | Frente |
+| Xbox `Y` ou Seta ↓ | Trás |
+| Xbox `A`, `B` ou Espaço | Parar |
 
-```text
-[uint16 big-endian tamanho][payload HID bruto]
-```
-
-Esse formato foi escolhido porque TCP e um fluxo de bytes. O cabecalho permite
-que o cliente saiba exatamente quantos bytes pertencem a cada report HID.
-
-### Drivezao
-
-O `Drivezao` e um modulo de kernel Linux escrito em C. Ele registra um
-`input_handler`, detecta dispositivos compativeis com controle Xbox ou teclado e
-envia comandos para a ESP32 por socket TCP em kernel space.
-
-Mapeamento no `Drivezao`:
-
-| Entrada | Acao |
-| --- | --- |
-| Xbox `X` ou seta para cima | Frente |
-| Xbox `Y` ou seta para baixo | Tras |
-| Xbox `A`, Xbox `B` ou espaco | Parar |
-
-O modulo usa uma workqueue para fazer a comunicacao TCP fora do callback de
-input. Assim, o callback apenas atualiza estado e agenda trabalho; a rede fica
-em um contexto apropriado.
-
-Enquanto um comando de movimento esta pressionado, o modulo envia heartbeats
-periodicos. Quando a tecla ou botao e solto, ele envia parada imediatamente.
-
-## Configuracao de Wi-Fi e Controle
-
-As credenciais reais ficam fora do Git. Para configurar, crie o arquivo local a
-partir do exemplo:
+## Configuração de Wi-Fi e Controle
 
 ```bash
 cp esp32_firmware/include/wifi_secrets.example.h esp32_firmware/include/wifi_secrets.h
 ```
 
-Depois preencha:
+Preencha em `esp32_firmware/include/wifi_secrets.h` (ignorado pelo `.gitignore`):
 
 ```c
 #define ROVER_WIFI_SSID "nome-da-rede"
 #define ROVER_WIFI_PASSWORD "senha-da-rede"
+#define MAC_XBOX "aa:bb:cc:dd:ee:ff" // opcional
 ```
 
-O MAC BLE do controle tambem pode ser definido no mesmo arquivo:
+## Compilação e Upload
 
-```c
-#define MAC_XBOX "aa:bb:cc:dd:ee:ff"
+### 1. Firmware ESP32-CAM (PlatformIO)
+
+```bash
+cd esp32_firmware
+pio run
+pio run --target upload
+pio device monitor -b 115200
 ```
 
-## Compilacao Pelo Makefile
+### 2. Módulo de Kernel Linux (`Drivezao.ko`)
 
-A compilacao documentada neste projeto e feita pelo Makefile do modulo Linux,
-localizado em `linux_kernel_module/Makefile`.
-
-O modulo deve ser compilado em um ambiente Linux com headers do kernel
-instalados. Pacotes comuns:
+Requer ambiente Linux com headers do kernel instalados:
 
 ```bash
 sudo apt install build-essential linux-headers-$(uname -r) bluez
 ```
 
-Verificar o ambiente:
+Principais comandos via `linux_kernel_module/Makefile`:
 
 ```bash
 make -C linux_kernel_module check
-```
-
-Compilar o modulo:
-
-```bash
 make -C linux_kernel_module all
-```
-
-Carregar o modulo apontando para a ESP32:
-
-```bash
 make -C linux_kernel_module load ESP_IP=<IP_DA_ESP32> ESP_PORT=8080 HEARTBEAT_MS=100
-```
-
-Ver status:
-
-```bash
 make -C linux_kernel_module status
-```
-
-Acompanhar logs:
-
-```bash
 make -C linux_kernel_module log
-```
-
-Remover o modulo:
-
-```bash
 make -C linux_kernel_module unload
-```
-
-Limpar artefatos de build:
-
-```bash
 make -C linux_kernel_module clean
 ```
 
-Alvos principais do Makefile:
+<details>
+<summary><b>Tabela completa de alvos e parâmetros do Makefile</b></summary>
 
-| Alvo | Funcao |
-| --- | --- |
-| `check` | Verifica headers, compilador, Bluetooth e estado do modulo. |
+| Alvo | Função |
+| :--- | :--- |
+| `check` | Verifica headers, compilador, Bluetooth e estado do módulo. |
 | `all` | Compila `Drivezao.ko`. |
-| `load` | Compila e carrega o modulo no kernel. |
-| `unload` | Remove o modulo do kernel. |
+| `load` | Compila e carrega o módulo no kernel. |
+| `unload` | Remove o módulo do kernel. |
 | `reload` | Remove, limpa, recompila e carrega novamente. |
-| `status` | Mostra modulo, entradas detectadas, logs e conexao TCP. |
-| `log` | Mostra logs filtrados do Drivezao em tempo real. |
-| `watch` | Alias para `log`. |
+| `status` | Mostra módulo, entradas detectadas, logs e conexão TCP. |
+| `log` / `watch` | Mostra logs filtrados do Drivezao em tempo real. |
 | `dmesg-full` | Mostra `dmesg` completo em tempo real. |
 | `bt-pair` | Abre fluxo de pareamento Bluetooth via `bluetoothctl`. |
 | `bt-status` | Mostra status do controle Xbox no Linux. |
-| `clean` | Remove artefatos de compilacao. |
-| `help` | Mostra ajuda do Makefile. |
+| `clean` | Remove artefatos de compilação. |
 
-Parametros aceitos na carga:
-
-| Parametro | Padrao | Descricao |
-| --- | --- | --- |
+| Parâmetro | Padrão | Descrição |
+| :--- | :--- | :--- |
 | `ESP_IP` | `192.168.100.65` | IP da ESP32. |
 | `ESP_PORT` | `8080` | Porta TCP de comandos. |
 | `HEARTBEAT_MS` | `100` | Intervalo entre comandos mantidos. |
 
-## Telemetria e Analise HID
+</details>
 
-Com a ESP32 conectada na rede, os scripts Python podem visualizar ou gravar a
-telemetria da porta `8081`.
-
-Visualizar reports HID:
+## Telemetria e Análise HID
 
 ```bash
+# Visualizar reports HID em tempo real
 python analise_Bytes_Controle/demonstracaoTCP.py <IP_DA_ESP32>
-```
-
-Mostrar tambem reports sem comando mapeado:
-
-```bash
 python analise_Bytes_Controle/demonstracaoTCP.py <IP_DA_ESP32> --todos
-```
 
-Capturar payloads para arquivo:
-
-```bash
+# Capturar payloads e analisar dumps
 python analise_Bytes_Controle/xbox_sniff.py <IP_DA_ESP32> --arquivo analise_Bytes_Controle/captura_xbox.txt
-```
-
-Analisar um dump salvo:
-
-```bash
-python analise_Bytes_Controle/analisar_dump.py analise_Bytes_Controle/xbox_dump.txt
 python analise_Bytes_Controle/analisar_dump.py analise_Bytes_Controle/xbox_dump.txt --detalhado
 ```
 
-## Sequencia Recomendada de Teste
+## Sequência Recomendada de Teste e Segurança de Bancada
 
-1. Configurar `wifi_secrets.h` com SSID, senha e, se necessario, MAC do controle.
-2. Gravar o firmware na ESP32-CAM pelo ambiente de desenvolvimento usado no projeto.
-3. Abrir o monitor serial e anotar o IP mostrado pela ESP32.
-4. Testar a telemetria com `demonstracaoTCP.py`.
-5. No Linux, rodar `make -C linux_kernel_module check`.
-6. Compilar o modulo com `make -C linux_kernel_module all`.
-7. Carregar com `make -C linux_kernel_module load ESP_IP=<IP_DA_ESP32>`.
-8. Acompanhar `make -C linux_kernel_module log`.
-9. Testar primeiro com as rodas suspensas.
-10. Testar no chao somente depois que parada e direcoes estiverem confirmadas.
-
-## Seguranca de Bancada
-
-- Teste sempre com as rodas fora do chao primeiro.
-- Tenha um meio fisico de cortar a energia dos motores.
-- Nao alimente motores pelo 3,3 V da ESP32.
-- Use GND comum entre ESP32 e ponte H.
-- Confira a polaridade da ponte H antes de colocar o rover no chao.
-- Envie `P` ou solte os botoes antes de mexer em cabos, bateria ou fonte.
+1. Configurar `wifi_secrets.h` e gravar o firmware na ESP32-CAM (`pio run --target upload`).
+2. Anotar o IP exibido no monitor serial (`115200 baud`) e validar a telemetria com `demonstracaoTCP.py`.
+3. Compilar e carregar `Drivezao.ko` apontando para `ESP_IP=<IP_DA_ESP32>`.
+4. **Segurança:** teste primeiro com as rodas fora do chão, tenha um corte físico de bateria, não alimente motores pelo 3,3 V da ESP32, mantenha GND comum entre ESP32 e ponte H e confirme a polaridade antes de colocar no chão.
